@@ -1,30 +1,217 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
-Description: AWS Serverless Spring Boot 2 API - com.amazonaws.serverless.archetypes::aws-serverless-springboot3-archetype
-Globals:
-  Api:
-    EndpointConfiguration: REGIONAL
-
 Resources:
-  AwsServerlessSpringboot3ArchetypeFunction:
-    Type: AWS::Serverless::Function
+  WeatherData:
+    Type: 'AWS::DynamoDB::Table'
     Properties:
+      TableName: Weather
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+
+  WeatherIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Join 
+          - ''
+          - - 'arn:'
+            - !Ref 'AWS::Partition'
+            - ':iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  LambdaDynamoDBPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: 'LambdaDynamoDBPolicy'
+      Roles:
+        - !Ref WeatherIamRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - 'dynamodb:*'
+            Resource: '*'
+
+  WeatherLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: svkbucket
+        S3Key: weather_app-0.0.1-SNAPSHOT.jar
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Weather
+          MY_AWS_REGION: 'us-east-1'
       Handler: com.example.weather_app.StreamLambdaHandler::handleRequest
-      Runtime: java21
-      CodeUri: .
-      MemorySize: 512
-      Policies: AWSLambdaBasicExecutionRole
+      MemorySize: 1024
+      Role: !GetAtt 
+        - WeatherIamRole
+        - Arn
+      Runtime: java17
       Timeout: 30
-      Events:
-        ProxyResource:
-          Type: Api
-          Properties:
-            Path: /{proxy+}
-            Method: any
+    DependsOn:
+      - LambdaDynamoDBPolicy
+      - WeatherIamRole
+
+  WeatherLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: 2012-10-17
+
+
+  WeatherRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Description: This service serves weather data.
+      Name: Weather-app-rest-api
+
+  WeatherApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt 
+        - WeatherRestApi
+        - RootResourceId
+      PathPart: '{proxy+}'
+      RestApiId: !Ref WeatherRestApi
+
+  WeatherApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        IntegrationHttpMethod: ANY
+        Type: AWS_PROXY
+        Uri: !Join 
+          - ''
+          - - 'arn:'
+            - !Ref 'AWS::Partition'
+            - ':apigateway:'
+            - !Ref 'AWS::Region'
+            - ':lambda:path/2015-03-31/functions/'
+            - !GetAtt 
+              - WeatherLambdaFunction
+              - Arn
+            - /invocations
+      ResourceId: !Ref WeatherApiResource
+      RestApiId: !Ref WeatherRestApi
+
+  WeatherApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      Description: This service serves weather data.
+      RestApiId: !Ref WeatherRestApi
+    DependsOn:
+      - WeatherApiMethod
+      - WeatherApiResource
+
+  WeatherApiDeploymentStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      DeploymentId: !Ref WeatherApiDeployment
+      RestApiId: !Ref WeatherRestApi
+      StageName: prod
+
+  WeatherApiLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt WeatherLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join 
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':execute-api:'
+          - !Ref 'AWS::Region'
+          - ':'
+          - !Ref 'AWS::AccountId'
+          - ':'
+          - !Ref WeatherRestApi
+          - /
+          - '*'
+          - /
+          - '*'
+          - /
+          - '*'
+  
+  WeatherApiEventRulePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt WeatherLambdaFunction.Arn
+      Principal: apidestinations.events.amazonaws.com
+      SourceArn: !Join 
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':events:'
+          - !Ref 'AWS::Region'
+          - ':'
+          - !Ref 'AWS::AccountId'
+          - ':'
+          - 'rule'
+          - /
+          - '*'
+
+  WeatherEventBus:
+    Type: 'AWS::Events::EventBus'
+    Properties:
+      Name: WeatherEventBus
+
+  WeatherEventBridgeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt 
+            - WeatherLambdaFunction
+            - Arn
+          Id: Target0
+
+  WeatherEventRulePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt 
+        - WeatherLambdaFunction
+        - Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt 
+        - WeatherEventBridgeRule
+        - Arn
 
 Outputs:
-  AwsServerlessSpringboot3ArchetypeApi:
-    Description: URL for application
-    Value: !Sub 'https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/ping'
-    Export:
-      Name: AwsServerlessSpringboot3ArchetypeApi
+  WeatherApiEndpoint9062F38A:
+    Value: !Join 
+      - ''
+      - - 'https://'
+        - !Ref WeatherRestApi
+        - .execute-api.
+        - !Ref 'AWS::Region'
+        - .
+        - !Ref 'AWS::URLSuffix'
+        - /
+        - !Ref WeatherApiDeploymentStage
+        - /
